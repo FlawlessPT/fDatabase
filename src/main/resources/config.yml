@@ -1,0 +1,10 @@
+database:
+  host: localhost
+  port: 3306
+  name: flawless
+  user: flawless_app
+  password: ""
+  ssl: false
+  pool:
+    maximumPoolSize: 8
+    connectionTimeoutMs: 10000

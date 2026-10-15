@@ -1,0 +1,5 @@
+name: fDatabase
+main: pt.flawless.fdatabase.FDatabase
+version: 1.0
+depend: [fAPI]
+description: Serviço de base de dados partilhado (MySQL)
