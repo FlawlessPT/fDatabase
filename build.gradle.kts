@@ -17,6 +17,7 @@ dependencies {
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("org.spigotmc:spigot:1.8-R0.1-SNAPSHOT")
+    testImplementation("pt.flawless:fapi:1.0")
 }
 
 tasks.withType<JavaCompile> { options.release = 17; options.encoding = "UTF-8" }
