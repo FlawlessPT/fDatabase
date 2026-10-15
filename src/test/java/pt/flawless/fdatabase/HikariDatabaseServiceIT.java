@@ -146,4 +146,81 @@ class HikariDatabaseServiceIT {
             assertEquals(1, one);
         }
     }
+
+    @Test
+    void constructor_wrongPassword_reportsDiagnosticsWithoutLeakingAnyPassword() {
+        DatabaseConfig real = TestDb.config();
+        String wrong = "wrong-pw-" + System.nanoTime() + "-Zq!";
+        DatabaseConfig bad = TestDb.configWithPassword(wrong);
+        SQLException e = assertThrows(SQLException.class, () -> new HikariDatabaseService(bad));
+        String message = e.getMessage();
+        assertTrue(message.contains("Access denied"), message);
+        assertTrue(message.contains(bad.host() + ":" + bad.port() + "/" + bad.name()), message);
+        assertFalse(message.contains(wrong), "a password errada vazou");
+        assertFalse(message.contains(real.password()), "a password real vazou");
+        assertNull(e.getCause(), "a causa não deve ser encadeada");
+    }
+
+    @Test
+    void constructor_unreachableHost_reportsRootCauseTypeAndHasNoCause() {
+        DatabaseConfig real = TestDb.config();
+        java.util.Map<String, String> env = new java.util.HashMap<>(System.getenv());
+        env.put("FLAWLESS_DB_PORT", "1");
+        org.bukkit.configuration.file.YamlConfiguration yaml = new org.bukkit.configuration.file.YamlConfiguration();
+        yaml.set("host", "x");
+        yaml.set("name", "x");
+        yaml.set("user", "x");
+        yaml.set("pool.connectionTimeoutMs", 1500);
+        DatabaseConfig bad = DatabaseConfig.load(yaml, env);
+        SQLException e = assertThrows(SQLException.class, () -> new HikariDatabaseService(bad));
+        assertTrue(e.getMessage().contains("(causa: "), e.getMessage());
+        assertFalse(e.getMessage().contains(real.password()));
+        assertNull(e.getCause());
+    }
+
+    private static org.bukkit.plugin.Plugin plugin(String name) {
+        return (org.bukkit.plugin.Plugin) java.lang.reflect.Proxy.newProxyInstance(
+                HikariDatabaseServiceIT.class.getClassLoader(), new Class<?>[]{org.bukkit.plugin.Plugin.class},
+                (proxy, method, args) -> {
+                    if (method.getName().equals("getName")) return name;
+                    if (method.getName().equals("getResource")) return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    @Test
+    void migrate_badMigrationName_throwsSqlExceptionWithPath() throws Exception {
+        try (HikariDatabaseService service = new HikariDatabaseService(TestDb.config())) {
+            SQLException e = assertThrows(SQLException.class,
+                    () -> service.migrate(plugin("itplugin"), List.of("db/nao_e_migracao.sql")));
+            assertTrue(e.getMessage().contains("db/nao_e_migracao.sql"), e.getMessage());
+            assertInstanceOf(IllegalArgumentException.class, e.getCause());
+        }
+    }
+
+    @Test
+    void migrate_nonIncreasingVersions_throwsSqlException() throws Exception {
+        try (HikariDatabaseService service = new HikariDatabaseService(TestDb.config())) {
+            SQLException e = assertThrows(SQLException.class, () -> service.migrate(plugin("itplugin"),
+                    List.of("db/V002__b.sql", "db/V001__a.sql")));
+            assertTrue(e.getMessage().contains("db/V001__a.sql"), e.getMessage());
+        }
+    }
+
+    @Test
+    void migrate_versionOverflow_throwsSqlException() throws Exception {
+        try (HikariDatabaseService service = new HikariDatabaseService(TestDb.config())) {
+            assertThrows(SQLException.class, () -> service.migrate(plugin("itplugin"),
+                    List.of("db/V99999999999__big.sql")));
+        }
+    }
+
+    @Test
+    void migrate_nullOwner_throwsNpeNamedOwner() throws Exception {
+        try (HikariDatabaseService service = new HikariDatabaseService(TestDb.config())) {
+            NullPointerException e = assertThrows(NullPointerException.class,
+                    () -> service.migrate(null, List.of("db/V001__a.sql")));
+            assertEquals("owner", e.getMessage());
+        }
+    }
 }

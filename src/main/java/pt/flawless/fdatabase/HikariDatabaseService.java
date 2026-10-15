@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -46,7 +47,7 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
     /**
      * Opens the pool and verifies a connection.
      *
-     * @throws SQLException if no connection can be obtained (the message never contains the password)
+     * @throws SQLException if no connection can be obtained (the message carries password-free diagnostics of the root cause, never the cause itself)
      */
     public HikariDatabaseService(DatabaseConfig config) throws SQLException {
         this(config, 10_000L);
@@ -64,7 +65,9 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
         hikari.setMaximumPoolSize(config.maximumPoolSize());
         hikari.setConnectionTimeout(config.connectionTimeoutMs());
         hikari.setInitializationFailTimeout(config.connectionTimeoutMs());
-        hikari.addDataSourceProperty("sslMode", config.ssl() ? "REQUIRED" : "DISABLED");
+        // PREFERRED: o MySQL 8.4 gera certificados e caching_sha2_password completa o handshake por TLS;
+        // com TLS desligado o driver só consegue autenticar por recuperação da chave pública (recusada).
+        hikari.addDataSourceProperty("sslMode", config.ssl() ? "REQUIRED" : "PREFERRED");
 
         HikariDataSource ds = null;
         try {
@@ -76,9 +79,10 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
             if (ds != null) {
                 ds.close();
             }
-            // A mensagem da causa pode ecoar credenciais: não é propagada.
+            // Só texto (sem encadear a causa): a mensagem é redigida para nunca conter a password.
             throw new SQLException("não foi possível ligar à base de dados em " + config.host() + ":"
-                    + config.port() + "/" + config.name() + " como " + config.user());
+                    + config.port() + "/" + config.name() + " como " + config.user()
+                    + diagnostics(e, config.password()));
         }
         this.dataSource = ds;
 
@@ -91,6 +95,25 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
             return thread;
         });
         this.executor.allowCoreThreadTimeOut(true);
+    }
+
+    /** " (causa: Tipo, SQLState=..., código=..., mensagem)" com a password substituída por {@code ***}. */
+    private static String diagnostics(Throwable failure, String password) {
+        Throwable root = failure;
+        for (int depth = 0; root.getCause() != null && root.getCause() != root && depth < 32; depth++) {
+            root = root.getCause();
+        }
+        StringBuilder text = new StringBuilder(" (causa: ").append(root.getClass().getSimpleName());
+        if (root instanceof SQLException) {
+            SQLException sql = (SQLException) root;
+            text.append(", SQLState=").append(sql.getSQLState()).append(", código=").append(sql.getErrorCode());
+        }
+        if (root.getMessage() != null) {
+            text.append(", ").append(root.getMessage());
+        }
+        text.append(')');
+        String result = text.toString();
+        return password == null || password.isEmpty() ? result : result.replace(password, "***");
     }
 
     @Override
@@ -114,7 +137,13 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
 
     @Override
     public void migrate(Plugin owner, List<String> resources) throws SQLException {
-        List<Migration> migrations = Migrations.parse(resources);
+        Objects.requireNonNull(owner, "owner");
+        List<Migration> migrations;
+        try {
+            migrations = Migrations.parse(resources);
+        } catch (IllegalArgumentException e) {
+            throw new SQLException(e.getMessage(), e);
+        }
         if (migrations.isEmpty()) {
             return;
         }
@@ -179,11 +208,15 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
 
         @Override
         public void run() {
+            T result;
             try (Connection connection = dataSource.getConnection()) {
-                future.complete(work.apply(connection));
+                result = work.apply(connection);
             } catch (Throwable t) {
                 future.completeExceptionally(t);
+                return;
             }
+            // Fora do try: a ligação já voltou ao pool quando os callbacks síncronos correm.
+            future.complete(result);
         }
 
         void cancel() {

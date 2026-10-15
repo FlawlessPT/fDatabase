@@ -22,7 +22,11 @@ dependencies {
 
 tasks.withType<JavaCompile> { options.release = 17; options.encoding = "UTF-8" }
 
-tasks.test { useJUnitPlatform() }
+tasks.test {
+    useJUnitPlatform()
+    // Os testes de integração usam sempre a base de testes, seja qual for o ambiente do utilizador.
+    environment("FLAWLESS_DB_NAME", "flawless_test")
+}
 
 // O jar "normal" fica desativado: o plugin é distribuído como jar sombreado (com as libs relocadas).
 tasks.jar { enabled = false }
