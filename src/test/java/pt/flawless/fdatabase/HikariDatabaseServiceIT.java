@@ -6,8 +6,14 @@ import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -65,6 +71,58 @@ class HikariDatabaseServiceIT {
         CompletableFuture<Void> ran = assertDoesNotThrow(() -> service.runAsync(c -> { }));
         assertTrue(supplied.isCompletedExceptionally());
         assertTrue(ran.isCompletedExceptionally());
+    }
+
+    @Test
+    void close_completesQueuedFuturesWhenTimeoutElapses() throws Exception {
+        HikariDatabaseService service = new HikariDatabaseService(TestDb.config(), 500L);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch started = new CountDownLatch(4);
+        List<CompletableFuture<Integer>> running = new ArrayList<>();
+        List<CompletableFuture<Integer>> queued = new ArrayList<>();
+        try {
+            for (int i = 0; i < 4; i++) {
+                running.add(service.supplyAsync(c -> {
+                    started.countDown();
+                    try {
+                        release.await();
+                    } catch (InterruptedException e) {
+                        throw new SQLException("interrompido", e);
+                    }
+                    return 1;
+                }));
+            }
+            assertTrue(started.await(10, TimeUnit.SECONDS), "as 4 threads deviam estar ocupadas");
+            for (int i = 0; i < 3; i++) {
+                queued.add(service.supplyAsync(c -> 2));
+            }
+            Thread closer = new Thread(service::close);
+            closer.start();
+            for (CompletableFuture<Integer> f : queued) {
+                try {
+                    f.get(5, TimeUnit.SECONDS);
+                    fail("a tarefa em fila não devia ter corrido");
+                } catch (TimeoutException e) {
+                    fail("future em fila ficou incompleto depois de close()");
+                } catch (ExecutionException | CancellationException expected) {
+                    // concluído excecionalmente, como exigido
+                }
+            }
+            closer.join(10_000);
+            assertFalse(closer.isAlive());
+            for (CompletableFuture<Integer> f : running) {
+                try {
+                    f.get(5, TimeUnit.SECONDS);
+                } catch (TimeoutException e) {
+                    fail("future em execução ficou incompleto depois de close()");
+                } catch (ExecutionException | CancellationException ignored) {
+                    // interrompido por shutdownNow
+                }
+            }
+        } finally {
+            release.countDown();
+            service.close();
+        }
     }
 
     @Test

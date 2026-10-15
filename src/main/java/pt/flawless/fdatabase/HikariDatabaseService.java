@@ -14,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
@@ -30,12 +31,17 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code get()} exposes it as the {@code ExecutionException} cause and {@code join()} as the
  * {@code CompletionException} cause). If the executor rejects the task (for instance after {@link #close()})
  * the future is completed exceptionally with the {@link RejectedExecutionException}; the methods never throw.
+ *
+ * <p>If {@link #close()} gives up waiting and cancels work that was queued but never started, those futures
+ * are completed exceptionally with a {@link CancellationException}; running work is interrupted and completes
+ * normally (usually exceptionally). No returned future is ever left incomplete.
  */
 public final class HikariDatabaseService implements DatabaseService, AutoCloseable {
 
     private final HikariDataSource dataSource;
     private final ThreadPoolExecutor executor;
     private final AtomicBoolean closed = new AtomicBoolean();
+    private final long closeTimeoutMillis;
 
     /**
      * Opens the pool and verifies a connection.
@@ -43,6 +49,12 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
      * @throws SQLException if no connection can be obtained (the message never contains the password)
      */
     public HikariDatabaseService(DatabaseConfig config) throws SQLException {
+        this(config, 10_000L);
+    }
+
+    /** Package-private: lets tests shorten the time {@link #close()} waits for running work. */
+    HikariDatabaseService(DatabaseConfig config, long closeTimeoutMillis) throws SQLException {
+        this.closeTimeoutMillis = closeTimeoutMillis;
         HikariConfig hikari = new HikariConfig();
         hikari.setPoolName("fdatabase");
         hikari.setDriverClassName(com.mysql.cj.jdbc.Driver.class.getName());
@@ -85,13 +97,7 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
     public <T> CompletableFuture<T> supplyAsync(SqlFunction<Connection, T> work) {
         CompletableFuture<T> future = new CompletableFuture<>();
         try {
-            executor.execute(() -> {
-                try (Connection connection = dataSource.getConnection()) {
-                    future.complete(work.apply(connection));
-                } catch (Throwable t) {
-                    future.completeExceptionally(t);
-                }
-            });
+            executor.execute(new Task<>(work, future));
         } catch (RejectedExecutionException e) {
             future.completeExceptionally(e);
         }
@@ -142,13 +148,47 @@ public final class HikariDatabaseService implements DatabaseService, AutoCloseab
         }
         executor.shutdown();
         try {
-            if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
-                executor.shutdownNow();
+            if (!executor.awaitTermination(closeTimeoutMillis, TimeUnit.MILLISECONDS)) {
+                cancelPending();
             }
         } catch (InterruptedException e) {
-            executor.shutdownNow();
+            cancelPending();
             Thread.currentThread().interrupt();
         }
         dataSource.close();
+    }
+
+    /** Interrupts running work and completes the futures of tasks that never started. */
+    private void cancelPending() {
+        for (Runnable pending : executor.shutdownNow()) {
+            if (pending instanceof Task) {
+                ((Task<?>) pending).cancel();
+            }
+        }
+    }
+
+    /** A unit of work that owns the future it must complete, so close() can complete it if it never runs. */
+    private final class Task<T> implements Runnable {
+        private final SqlFunction<Connection, T> work;
+        private final CompletableFuture<T> future;
+
+        Task(SqlFunction<Connection, T> work, CompletableFuture<T> future) {
+            this.work = work;
+            this.future = future;
+        }
+
+        @Override
+        public void run() {
+            try (Connection connection = dataSource.getConnection()) {
+                future.complete(work.apply(connection));
+            } catch (Throwable t) {
+                future.completeExceptionally(t);
+            }
+        }
+
+        void cancel() {
+            future.completeExceptionally(
+                    new CancellationException("serviço de base de dados encerrado antes de a tarefa começar"));
+        }
     }
 }
